@@ -308,16 +308,17 @@ def process_multiple_files(file_pattern: str = "*.json",
                            folder: Union[str, Path] = ".") -> pd.DataFrame:
     """Process all JSON files matching a pattern in a folder."""
     folder = Path(folder)
-    files = sorted(folder.glob(file_pattern))
-    print(f"Found {len(files)} JSON file(s) in {folder}")
+    # Use rglob to recursively find all JSON files in subfolders
+    files = sorted(folder.rglob(file_pattern))
+    print(f"Found {len(files)} JSON file(s) in {folder} and subfolders")
 
     dfs = []
     for fp in files:
-        print(f"\nProcessing: {fp.name}")
+        print(f"\nProcessing: {fp.relative_to(folder)}")
         dfs.append(process_json_file(fp))
 
     if not dfs:
-        raise FileNotFoundError(f"No files matching '{file_pattern}' in {folder}")
+        raise FileNotFoundError(f"No files matching '{file_pattern}' in {folder} or its subfolders")
 
     combined = pd.concat(dfs, ignore_index=True)
     print(f"\n✓ Total samples extracted: {len(combined)}")

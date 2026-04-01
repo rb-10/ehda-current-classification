@@ -19,12 +19,3 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
-
-# Datasets
-datasets/
-data/
-experiments/
-dataset/
-
-#Scaler
-scalers

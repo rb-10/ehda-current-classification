@@ -487,7 +487,7 @@ if __name__ == "__main__":
     print(f"Loading data from: {folder}")
 
     df = process_multiple_files("*.json", folder=folder)
-    df_norm, X, labels, feature_names, normalizer = prepare_training_data(df)
+    df_norm, X, labels, feature_names, normalizer = prepare_training_data(df, drop_metadata=True, exclude_label="EXCLUDE")
 
     results = train(X, labels, feature_names)
 

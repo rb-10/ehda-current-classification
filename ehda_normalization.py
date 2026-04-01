@@ -277,6 +277,8 @@ def prepare_training_data(
     df: pd.DataFrame,
     signal_norm_method: str = "zscore",
     scaler_save_path: str = "scalers",
+    drop_metadata: bool = False,
+    exclude_label: str = "EXCLUDE",
 ) -> Tuple[pd.DataFrame, np.ndarray, list, "EHDAFeatureNormalizer"]:
     """
     Full pipeline from raw feature DataFrame to model-ready arrays.
@@ -298,20 +300,27 @@ def prepare_training_data(
     feature_names   : list of feature column names (same order as X)
     normalizer      : fitted EHDAFeatureNormalizer (save this!)
     """
-    # Drop any samples with missing labels
+
+    # Drop any samples with missing labels or excluded label
     df = df.dropna(subset=["label"]).copy()
-    df = df[df["label"] != "N/A"].copy()
+    df = df[(df["label"] != "N/A") & (df["label"] != exclude_label)].copy()
 
     normalizer = EHDAFeatureNormalizer()
     df_norm = normalizer.fit_transform(df)
 
+    # Optionally drop metadata columns
+    feature_names = normalizer.get_feature_columns()
+    if drop_metadata:
+        feature_names = [f for f in feature_names if f not in METADATA_FEATURES]
+        keep_cols = feature_names + ["label"] + [c for c in NON_FEATURE_COLS if c in df_norm.columns and c != "label"]
+        df_norm = df_norm[keep_cols]
+
+
+    X = df_norm[feature_names].values
+    labels = df_norm["label"].values
     # Save scalers so inference can use identical transforms
     normalizer.save(scaler_save_path)
 
-    feature_names = normalizer.get_feature_columns()
-    X = df_norm[feature_names].values
-
-    labels = df_norm["label"].values
     print(f"\n✓ Training data ready: {X.shape[0]} samples × {X.shape[1]} features")
     print(f"  Label distribution:")
     unique, counts = np.unique(labels, return_counts=True)
