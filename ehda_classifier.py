@@ -35,17 +35,19 @@ warnings.filterwarnings("ignore")
 from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import (StratifiedKFold, cross_validate,
-                                     train_test_split)
+                                     train_test_split, RandomizedSearchCV)
 from sklearn.metrics import (classification_report, confusion_matrix,
                               ConfusionMatrixDisplay)
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, LabelBinarizer
+from sklearn.base import BaseEstimator, ClassifierMixin
+import scipy.linalg as la
 
 try:
     from xgboost import XGBClassifier
     XGBOOST_AVAILABLE = True
 except ImportError:
     XGBOOST_AVAILABLE = False
-    print("⚠ XGBoost not installed — skipping XGB model. Run: pip install xgboost")
+    print("WARNING: XGBoost not installed - skipping XGB model. Run: pip install xgboost")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,6 +90,75 @@ def _build_xgboost(n_classes: int) -> "XGBClassifier":
         verbosity=0,
     )
 
+class ELMClassifier(BaseEstimator, ClassifierMixin):
+    def __init__(self, n_hidden=1000, activation='tanh', C=1e-3, random_state=42):
+        self.n_hidden = n_hidden
+        self.activation = activation
+        self.C = C            # Tikhonov regularization strength — larger = smoother,
+                              # smaller = closer to exact pseudoinverse fit
+        self.random_state = random_state
+        self.lb_ = None
+        self.w_ = None
+        self.b_ = None
+        self.beta_ = None
+        
+    def _activate(self, X):
+        if self.activation == 'tanh':
+            return np.tanh(X)
+        elif self.activation == 'relu':
+            return np.maximum(X, 0)
+        elif self.activation == 'sigmoid':
+            # Avoid overflow in sigmoid
+            return 1 / (1 + np.exp(-np.clip(X, -500, 500)))
+        else:
+            return X
+
+    def fit(self, X, y):
+        self.lb_ = LabelBinarizer()
+        Y = self.lb_.fit_transform(y)
+        if Y.shape[1] == 1:
+            Y = np.hstack((1 - Y, Y))
+            
+        rng = np.random.RandomState(self.random_state)
+        n_features = X.shape[1]
+        
+        self.w_ = rng.normal(size=(n_features, self.n_hidden))
+        self.b_ = rng.normal(size=self.n_hidden)
+        
+        H = self._activate(np.dot(X, self.w_) + self.b_)
+        # Tikhonov-regularized least squares: β = (HᵀH + C·I)⁻¹ Hᵀ Y
+        # This replaces the bare pseudoinverse (la.pinv(H)) which is unstable
+        # when H is near-singular — a common occurrence when input features
+        # are nearly constant or highly correlated.
+        # C controls the bias-variance trade-off: larger C → more regularization.
+        I = np.eye(self.n_hidden)
+        self.beta_ = np.linalg.solve(H.T @ H + self.C * I, H.T @ Y)
+        return self
+        
+    def predict_proba(self, X):
+        H = self._activate(np.dot(X, self.w_) + self.b_)
+        raw_preds = np.dot(H, self.beta_)
+        # Softmax
+        # clip max to avoid exp overflow
+        max_rep = np.max(raw_preds, axis=1, keepdims=True)
+        exp_preds = np.exp(raw_preds - max_rep)
+        return exp_preds / np.sum(exp_preds, axis=1, keepdims=True)
+        
+    def predict(self, X):
+        H = self._activate(np.dot(X, self.w_) + self.b_)
+        raw_preds = np.dot(H, self.beta_)
+        return self.lb_.classes_[np.argmax(raw_preds, axis=1)]
+
+def _tune_hyperparameters(model, param_grid, X, y, model_name):
+    print(f"\n  Tuning hyperparameters for {model_name}...")
+    search = RandomizedSearchCV(
+        model, param_distributions=param_grid,
+        n_iter=80, cv=5, scoring='f1_macro',   # was n_iter=5, cv=3
+        n_jobs=-1, random_state=RANDOM_STATE
+    )
+    search.fit(X, y)
+    print(f"  Best params for {model_name}: {search.best_params_}")
+    return search.best_estimator_
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CROSS-VALIDATION
@@ -120,6 +191,10 @@ def _cross_validate_model(model, X: np.ndarray, y: np.ndarray,
 def _plot_feature_importance(model, feature_names: list,
                               model_name: str, top_n: int = 25) -> pd.DataFrame:
     """Extract and plot the top N most important features."""
+    if not hasattr(model, "feature_importances_"):
+        print(f"  No feature importances to plot for {model_name}.")
+        return pd.DataFrame()
+        
     importances = model.feature_importances_
     df_imp = pd.DataFrame({
         "feature":    feature_names,
@@ -313,15 +388,21 @@ def _plot_model_comparison(all_results: list) -> None:
 # MAIN TRAIN FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
 def train(X: np.ndarray, labels: np.ndarray,
-          feature_names: list) -> dict:
+          feature_names: list,
+          normalizer=None,
+          scaler_save_path: str = "scalers") -> dict:
     """
     Full training pipeline.
 
     Parameters
     ----------
-    X             : feature matrix from prepare_training_data()
+    X             : RAW feature matrix from prepare_training_data()
     labels        : string label array  e.g. ["dripping", "cone_jet", ...]
     feature_names : list of feature column names (same order as X columns)
+    normalizer    : unfitted EHDAFeatureNormalizer returned by prepare_training_data().
+                    It will be fitted on X_train only (after the split) to prevent
+                    data leakage. Pass None to skip normalization entirely.
+    scaler_save_path : where to save the fitted scalers for inference reuse.
 
     Returns
     -------
@@ -352,11 +433,35 @@ def train(X: np.ndarray, labels: np.ndarray,
         X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
     )
 
+    # ── Normalizer: fit on training set ONLY ─────────────────────────────────
+    # Fitting before the split (on all data) leaks test-set statistics into the
+    # scaler, making test metrics optimistic. We fit here, after splitting, so
+    # the scaler is blind to the test set — the correct procedure.
+    if normalizer is not None:
+        X_train_df = pd.DataFrame(X_train, columns=feature_names)
+        X_test_df  = pd.DataFrame(X_test,  columns=feature_names)
+        normalizer.fit(X_train_df)
+        X_train = normalizer.transform(X_train_df)[feature_names].values
+        X_test  = normalizer.transform(X_test_df)[feature_names].values
+        save_path = getattr(normalizer, "_scaler_save_path", scaler_save_path)
+        normalizer.save(save_path)
+        print(f"  Normalizer fitted on {len(X_train_df)} training samples → saved to {save_path}/")
+    else:
+        print(f"  WARNING: No normalizer provided — using raw (unscaled) features.")
+
     all_results = []
 
     # ── Random Forest ────────────────────────────────────────────────────────
+    rf_base = _build_random_forest(n_classes)
+    rf_grid = {
+        'n_estimators': [100, 300, 500],
+        'max_depth': [None, 10, 20, 30],
+        'min_samples_leaf': [1, 2, 4],
+    }
+    rf_tuned = _tune_hyperparameters(rf_base, rf_grid, X_train, y_train, "Random Forest")
+    
     rf_result = _train_one(
-        model        = _build_random_forest(n_classes),
+        model        = rf_tuned,
         model_name   = "Random Forest",
         X_train=X_train, y_train=y_train,
         X_test=X_test,   y_test=y_test,
@@ -368,8 +473,17 @@ def train(X: np.ndarray, labels: np.ndarray,
 
     # ── XGBoost ──────────────────────────────────────────────────────────────
     if XGBOOST_AVAILABLE:
+        xgb_base = _build_xgboost(n_classes)
+        xgb_grid = {
+            'n_estimators': [100, 300, 500],
+            'max_depth': [3, 6, 9],
+            'learning_rate': [0.01, 0.05, 0.1, 0.2],
+            'subsample': [0.6, 0.8, 1.0],
+        }
+        xgb_tuned = _tune_hyperparameters(xgb_base, xgb_grid, X_train, y_train, "XGBoost")
+    
         xgb_result = _train_one(
-            model        = _build_xgboost(n_classes),
+            model        = xgb_tuned,
             model_name   = "XGBoost",
             X_train=X_train, y_train=y_train,
             X_test=X_test,   y_test=y_test,
@@ -378,6 +492,26 @@ def train(X: np.ndarray, labels: np.ndarray,
             label_encoder=le,
         )
         all_results.append(xgb_result)
+
+    # ── ELM ──────────────────────────────────────────────────────────────────
+    elm_base = ELMClassifier()
+    elm_grid = {
+        'n_hidden': [500, 1000, 2000],
+        'activation': ['relu', 'tanh', 'sigmoid'],
+        'C': [1e-4, 1e-3, 1e-2, 0.1],   # regularization strength
+    }
+    elm_tuned = _tune_hyperparameters(elm_base, elm_grid, X_train, y_train, "ELM")
+
+    elm_result = _train_one(
+        model        = elm_tuned,
+        model_name   = "ELM",
+        X_train=X_train, y_train=y_train,
+        X_test=X_test,   y_test=y_test,
+        feature_names=feature_names,
+        class_names=class_names,
+        label_encoder=le,
+    )
+    all_results.append(elm_result)
 
     # ── Compare & pick best ──────────────────────────────────────────────────
     _plot_model_comparison(all_results)
@@ -393,11 +527,14 @@ def train(X: np.ndarray, labels: np.ndarray,
     print(f"  Saved label encoder and metadata to {MODEL_DIR}/")
 
     # Print top 10 features from best model
-    print(f"\n  Top 10 most important features ({best['model_name']}):")
-    print(f"  {'Rank':<6} {'Feature':<40} {'Importance':>10}")
-    print(f"  {'-'*58}")
-    for i, row in best["importances"].head(10).iterrows():
-        print(f"  {i+1:<6} {row['feature']:<40} {row['importance']:>10.4f}")
+    if not best["importances"].empty:
+        print(f"\n  Top 10 most important features ({best['model_name']}):")
+        print(f"  {'Rank':<6} {'Feature':<40} {'Importance':>10}")
+        print(f"  {'-'*58}")
+        for i, row in best["importances"].head(10).iterrows():
+            print(f"  {i+1:<6} {row['feature']:<40} {row['importance']:>10.4f}")
+    else:
+        print(f"\n  No feature importances available for {best['model_name']}.")
 
     return {
         "random_forest":  rf_result,
@@ -436,7 +573,7 @@ class EHDAClassifier:
         label_encoder = joblib.load(folder / "label_encoder.pkl")
         class_names   = joblib.load(folder / "class_names.pkl")
         feature_names = joblib.load(folder / "feature_names.pkl")
-        print(f"✓ Loaded {model_name} from {folder}/")
+        print(f"SUCCESS Loaded {model_name} from {folder}/")
         return cls(model, label_encoder, class_names, feature_names)
 
     def predict(self, x: np.ndarray) -> tuple:
@@ -487,9 +624,10 @@ if __name__ == "__main__":
     print(f"Loading data from: {folder}")
 
     df = process_multiple_files("*.json", folder=folder)
+
     df_norm, X, labels, feature_names, normalizer = prepare_training_data(df, drop_metadata=True, exclude_label="EXCLUDE")
 
-    results = train(X, labels, feature_names)
+    results = train(X, labels, feature_names, normalizer=normalizer)
 
     print(f"\n{'='*60}")
     print(f"  DONE — files saved to:")

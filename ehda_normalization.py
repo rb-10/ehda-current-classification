@@ -76,7 +76,7 @@ METADATA_FEATURES = [
 ]
 
 # Columns that are never fed to the model
-NON_FEATURE_COLS = ["sample_id", "label", "timestamp", "source_file"]
+NON_FEATURE_COLS = ["sample_id", "label", "timestamp", "source_file", "is_clean_label"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,7 +206,7 @@ class EHDAFeatureNormalizer:
             self.metadata_scaler.fit(df[self.metadata_cols])
 
         self.fitted = True
-        print(f"✓ Normalizer fitted on {len(df)} samples")
+        print(f"SUCCESS Normalizer fitted on {len(df)} samples")
         print(f"  Amplitude features (RobustScaler):   {len(self.amplitude_cols)}")
         print(f"  Metadata features  (StandardScaler): {len(self.metadata_cols)}")
         print(f"  Invariant features (untouched):      {len(self.invariant_cols)}")
@@ -250,7 +250,7 @@ class EHDAFeatureNormalizer:
             "invariant_cols": self.invariant_cols,
             "fitted":         self.fitted,
         }, folder / "normalizer_meta.pkl")
-        print(f"✓ Scalers saved to {folder}/")
+        print(f"SUCCESS Scalers saved to {folder}/")
 
     @classmethod
     def load(cls, folder: str = "scalers") -> "EHDAFeatureNormalizer":
@@ -264,7 +264,7 @@ class EHDAFeatureNormalizer:
         obj.metadata_cols  = meta["metadata_cols"]
         obj.invariant_cols = meta["invariant_cols"]
         obj.fitted         = meta["fitted"]
-        print(f"✓ Scalers loaded from {folder}/")
+        print(f"SUCCESS Scalers loaded from {folder}/")
         return obj
 
 
@@ -279,55 +279,67 @@ def prepare_training_data(
     scaler_save_path: str = "scalers",
     drop_metadata: bool = False,
     exclude_label: str = "EXCLUDE",
-) -> Tuple[pd.DataFrame, np.ndarray, list, "EHDAFeatureNormalizer"]:
+) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, list, "EHDAFeatureNormalizer"]:
     """
-    Full pipeline from raw feature DataFrame to model-ready arrays.
+    Prepare raw (un-normalized) feature arrays for training.
 
-    Note: signal normalization (Layer 1) should ideally be applied
-    BEFORE feature extraction (in ehda_feature_extraction.py).
-    This function handles Layer 2 (feature normalization).
+    The normalizer is intentionally NOT fitted here to prevent data leakage.
+    Fitting happens inside train() after the train/test split, so the scaler
+    only ever sees training-set statistics. The returned normalizer carries
+    column-type metadata (which columns are amplitude, metadata, invariant)
+    and is passed to train() to be fitted there.
 
     Parameters
     ----------
-    df              : DataFrame from ehda_feature_extraction.py
-    signal_norm_method : kept here for documentation; apply in extraction step
-    scaler_save_path   : where to persist fitted scalers
+    df              : DataFrame from feature_extraction.py
+    signal_norm_method : for documentation only — apply in extraction step
+    scaler_save_path   : passed to train() so it knows where to save scalers
+    drop_metadata   : if True, exclude operating-condition columns (voltage,
+                      flow_rate, etc.) — recommended for cross-solution models
+    exclude_label   : rows with this label are dropped before training
 
     Returns
     -------
-    df_norm         : normalized DataFrame (all columns)
-    X               : feature matrix as numpy array (ready for model)
-    feature_names   : list of feature column names (same order as X)
-    normalizer      : fitted EHDAFeatureNormalizer (save this!)
+    df              : filtered raw DataFrame (not normalized)
+    X               : raw feature matrix as numpy array
+    labels          : string label array
+    feature_names   : ordered list of feature column names
+    normalizer      : EHDAFeatureNormalizer with column metadata set but NOT
+                      fitted — pass this to train() to fit on X_train only
     """
-
     # Drop any samples with missing labels or excluded label
     df = df.dropna(subset=["label"]).copy()
     df = df[(df["label"] != "N/A") & (df["label"] != exclude_label)].copy()
 
-    normalizer = EHDAFeatureNormalizer()
-    df_norm = normalizer.fit_transform(df)
+    # Classify columns into groups — but do NOT fit the scalers yet.
+    # Fitting on the full dataset would leak test-set statistics into the scaler.
+    amplitude_cols, metadata_cols, invariant_cols, _ = _classify_columns(df)
 
-    # Optionally drop metadata columns
-    feature_names = normalizer.get_feature_columns()
+    # Build the ordered feature list
+    all_feature_cols = amplitude_cols + metadata_cols + invariant_cols
     if drop_metadata:
-        feature_names = [f for f in feature_names if f not in METADATA_FEATURES]
-        keep_cols = feature_names + ["label"] + [c for c in NON_FEATURE_COLS if c in df_norm.columns and c != "label"]
-        df_norm = df_norm[keep_cols]
+        all_feature_cols = [f for f in all_feature_cols if f not in METADATA_FEATURES]
 
+    # Pre-populate normalizer column lists so train() knows how to scale each column.
+    # Only include columns that are actually in the selected feature set.
+    normalizer = EHDAFeatureNormalizer()
+    normalizer.amplitude_cols = [c for c in amplitude_cols if c in all_feature_cols]
+    normalizer.metadata_cols  = [c for c in metadata_cols  if c in all_feature_cols]
+    normalizer.invariant_cols = [c for c in invariant_cols if c in all_feature_cols]
+    normalizer._scaler_save_path = scaler_save_path  # carry through for train()
 
-    X = df_norm[feature_names].values
-    labels = df_norm["label"].values
-    # Save scalers so inference can use identical transforms
-    normalizer.save(scaler_save_path)
+    feature_names = all_feature_cols
+    X      = df[feature_names].values
+    labels = df["label"].values
 
-    print(f"\n✓ Training data ready: {X.shape[0]} samples × {X.shape[1]} features")
+    print(f"\nSUCCESS Raw training data ready: {X.shape[0]} samples × {X.shape[1]} features")
+    print(f"  NOTE: normalizer is unfitted — it will be fitted on X_train inside train()")
     print(f"  Label distribution:")
     unique, counts = np.unique(labels, return_counts=True)
     for u, c in zip(unique, counts):
         print(f"    {u:<20} {c} samples")
 
-    return df_norm, X, labels, feature_names, normalizer
+    return df, X, labels, feature_names, normalizer
 
 
 def prepare_inference_sample(
@@ -374,4 +386,4 @@ if __name__ == "__main__":
 
     out_path = Path(folder) / "ehda_features_normalized.csv"
     df_norm.to_csv(out_path, index=False)
-    print(f"\n✓ Normalized features saved to: {out_path}")
+    print(f"\nSUCCESS Normalized features saved to: {out_path}")

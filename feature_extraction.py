@@ -197,27 +197,47 @@ def extract_metadata(sample: dict) -> dict:
 # ─────────────────────────────────────────────
 # MAIN EXTRACTION FUNCTION
 # ─────────────────────────────────────────────
-def extract_features(sample: dict) -> dict:
+def extract_features(sample: dict, normalize_signal: bool = False) -> dict:
     """
     Extract all features from a single sample dict.
     Returns a flat feature dictionary ready for a DataFrame row.
+
+    Parameters
+    ----------
+    normalize_signal : bool (default False)
+        If True, z-score the raw current signal before feature extraction.
+        This makes shape-based features solution-agnostic (useful when
+        training across multiple solutions with very different conductivities),
+        but destroys all amplitude information — mean, std, rms, variance,
+        and absolute band powers become ~constant across every sample.
+        Leave False (default) unless you have a specific cross-solution
+        generalization need; amplitude features are strong spray-mode
+        discriminators within a single solution.
     """
     x_raw = np.array(sample["current"], dtype=np.float64)
 
-    # ── Layer 1: Signal normalization ──────────────────────────────────────
-    # Normalize signal to zero mean, unit variance BEFORE computing features.
-    # This makes shape-based features (kurtosis, crest factor, spectral
-    # entropy, relative band powers, wavelet ratios) identical across
-    # solutions that differ only in conductivity / absolute current level.
-    # Precomputed values from JSON (mean, rms, etc.) come from the RAW signal,
-    # so we recompute them on the normalized signal for consistency.
-    x = _zscore(x_raw)
-    # After z-score: mean≈0, std≈1, so precomputed values no longer apply.
-    precomputed = {}   # recomputed from normalized signal inside extract_time_domain
+    # ── Layer 1: Signal normalization (optional) ────────────────────────────
+    if normalize_signal:
+        x = _zscore(x_raw)
+        # After z-score: mean≈0, std≈1 — precomputed JSON values no longer apply.
+        precomputed = {}
+    else:
+        x = x_raw
+        # Use precomputed values from JSON where available to avoid redundancy.
+        precomputed = {
+            "mean":     sample.get("mean"),
+            "deviation": sample.get("deviation"),
+            "median":   sample.get("median"),
+            "rms":      sample.get("rms"),
+            "variance": sample.get("variance"),
+        }
+        # Filter out None values so extract_time_domain falls back to computing them
+        precomputed = {k: v for k, v in precomputed.items() if v is not None}
 
     features = {}
     features["sample_id"] = sample.get("id")
-    features["label"]     = sample.get("spray_mode")   # ← classification target
+    # All labels stored under image_classification; fall back to spray_mode if absent
+    features["label"]     = sample.get("image_classification", sample.get("spray_mode"))
     features["timestamp"] = sample.get("timestamp")
 
     features.update(extract_metadata(sample))
@@ -279,7 +299,7 @@ def _parse_samples(data, filepath):
     )
 
 
-def process_json_file(filepath):
+def process_json_file(filepath, normalize_signal: bool = False):
     """Load a single JSON file and extract features from all samples."""
     filepath = Path(filepath)
     with open(filepath, "r") as f:
@@ -292,38 +312,46 @@ def process_json_file(filepath):
     for i, sample in enumerate(samples):
         key  = sample.get("sample_key", f"#{i+1}")
         sid  = sample.get("id", "?")
-        mode = sample.get("spray_mode", "?")
+        mode = sample.get("image_classification", sample.get("spray_mode", "?"))
         print(f"  [{filepath.name}]  {key}  (id={sid}, mode={mode})  [{i+1}/{total}]")
         try:
-            row = extract_features(sample)
+            row = extract_features(sample, normalize_signal=normalize_signal)
             row["source_file"] = filepath.name
             rows.append(row)
         except Exception as e:
-            print(f"    ⚠ Skipped {key} (id={sid}): {e}")
+            print(f"    \u26a0 Skipped {key} (id={sid}): {e}")
 
     return pd.DataFrame(rows)
 
 
 def process_multiple_files(file_pattern: str = "*.json",
-                           folder: Union[str, Path] = ".") -> pd.DataFrame:
-    """Process all JSON files matching a pattern in a folder."""
+                           folder: Union[str, Path] = ".",
+                           normalize_signal: bool = False) -> pd.DataFrame:
+    """Process all JSON files matching a pattern in a folder.
+
+    Parameters
+    ----------
+    normalize_signal : bool (default False)
+        Passed to extract_features(). See its docstring for the trade-off.
+        Leave False unless you are training across multiple solutions.
+    """
     folder = Path(folder)
-    # Use rglob to recursively find all JSON files in subfolders
-    files = sorted(folder.rglob(file_pattern))
+    # Use rglob to recursively find all JSON files in subfolders, ignoring .venv
+    files = [f for f in sorted(folder.rglob(file_pattern)) if ".venv" not in f.parts]
     print(f"Found {len(files)} JSON file(s) in {folder} and subfolders")
 
     dfs = []
     for fp in files:
         print(f"\nProcessing: {fp.relative_to(folder)}")
-        dfs.append(process_json_file(fp))
+        dfs.append(process_json_file(fp, normalize_signal=normalize_signal))
 
     if not dfs:
         raise FileNotFoundError(f"No files matching '{file_pattern}' in {folder} or its subfolders")
 
     combined = pd.concat(dfs, ignore_index=True)
-    print(f"\n✓ Total samples extracted: {len(combined)}")
-    print(f"✓ Total features per sample: {combined.shape[1]}")
-    print(f"✓ Label distribution:\n{combined['label'].value_counts()}")
+    print(f"\nSUCCESS Total samples extracted: {len(combined)}")
+    print(f"SUCCESS Total features per sample: {combined.shape[1]}")
+    print(f"SUCCESS Label distribution:\n{combined['label'].value_counts()}")
     return combined
 
 
@@ -343,7 +371,7 @@ if __name__ == "__main__":
     # Save feature matrix
     out_path = Path(folder) / "ehda_features.csv"
     df.to_csv(out_path, index=False)
-    print(f"\n✓ Saved to: {out_path}")
+    print(f"\nSUCCESS Saved to: {out_path}")
 
     # Quick summary
     feature_cols = [c for c in df.columns
